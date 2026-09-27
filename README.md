@@ -55,6 +55,14 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096 \
 No GPU? Add `--hf-jobs` to any train command to run it on Hugging Face Jobs
 instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
+## Simulated 1v1 football
+
+The [football training guide](docs/football.md) covers a two-Microduck
+walled arena, tactical self-play, student-driven on-policy distillation,
+joint-space self-play, fixed-seed evaluation, and match videos. Start with
+`uv run football-train tactics --help`, `uv run football-eval --help`, and
+`uv run football-play --help`.
+
 ## Tasks
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.

@@ -54,6 +54,9 @@ train = "mjlab_microduck.train_cli:main"
 # Serve a simulated body to the real `robotd` — see sim/body_server.py.
 duck-body = "mjlab_microduck.sim.body_server:main"
 publish = "mjlab_microduck.publish.cli:main"
+football-train = "mjlab_microduck.football.cli:main"
+football-eval = "mjlab_microduck.football.eval:main"
+football-play = "mjlab_microduck.football.play:main"
 [tool.ruff]
 src = ["src"]  # Helpful for recognizing first-party imports.
 indent-width = 4
