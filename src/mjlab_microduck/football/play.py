@@ -144,10 +144,6 @@ class FootballPlayEnv(FootballVecEnv):
         if (ids == 0).any():
             self.refresh_appearance()
 
-    def _score(self) -> tuple[int, int]:
-        values = self.arena.scores[0].tolist()
-        return tuple(values if self.learner_home[0] else values[::-1])
-
     def announce_match(self) -> None:
         seat = "home" if self.learner_home[0] else "away"
         side = 0 if self.learner_home[0] else 1
@@ -160,7 +156,6 @@ class FootballPlayEnv(FootballVecEnv):
         return result
 
     def step(self, actions: torch.Tensor):
-        previous = self.arena.scores[0].clone()
         result = super().step(actions)
         completed = result[3]["completed"]
         if completed["env_ids"].numel():
@@ -175,9 +170,6 @@ class FootballPlayEnv(FootballVecEnv):
                 " (opponent left the field)" if other_out else "")
             print(f"Match over: {ours}–{theirs} ({outcome}){reason}.", flush=True)
             self.announce_match()
-        elif not torch.equal(previous, self.arena.scores[0]):
-            ours, theirs = self._score()
-            print(f"Goal! Score {ours}–{theirs}.", flush=True)
         return result
 
 

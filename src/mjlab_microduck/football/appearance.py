@@ -50,6 +50,8 @@ class FootballAppearance:
         """Reapply colors after an env-0 match selects a side and opponent."""
         for side in ("home", "away"):
             self.model.mat_rgba[self.material_ids[side]] = self.original_rgba[side]
+        if opponent_kind == "live":
+            return  # Both ducks use the policy being trained and keep its colors.
         opponent_side = "away" if learner_home else "home"
         color = OPPONENT_COLORS[opponent_kind]
         self.model.mat_rgba[self.material_ids[opponent_side], :3] = color

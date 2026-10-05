@@ -1,4 +1,4 @@
-"""Checkpoint-aware PPO runner for the three football stages."""
+"""Checkpoint-aware PPO runner for football training phases."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch
 from rsl_rl.runners import OnPolicyRunner
 
 from mjlab_microduck.football.wrapper import FootballVecEnv
+from mjlab_microduck.football.learning import expand_football_checkpoint_observations
 
 
 class FootballRunner(OnPolicyRunner):
@@ -87,6 +88,7 @@ class FootballRunner(OnPolicyRunner):
             raise ValueError("checkpoint is not from the requested football stage")
         if meta["skill_hashes"] != self.skill_hashes:
             raise ValueError("skill checkpoints differ from those in the saved football run")
+        expand_football_checkpoint_observations(state, self.alg.actor, self.alg.critic)
         self.alg.load(state, load_cfg, strict)
         self.current_learning_iteration = int(state["iter"])
         self.best_score = float(meta.get("best_score", float("-inf")))

@@ -8,6 +8,9 @@ the real robot. Sim2real transfer
 is the whole point: every convention below exists because breaking it produced a
 policy that worked in the viewer and failed on hardware.
 
+## Environment
+Use `mjlab-microduck` venv to run all your commands
+
 ## Commands
 
 ```bash

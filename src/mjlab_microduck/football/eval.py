@@ -12,11 +12,12 @@ import random
 import numpy as np
 import torch
 from mjlab.envs import ManagerBasedRlEnv
+from tensordict import TensorDict
 from mjlab.utils.wrappers import VideoRecorder
 
 from mjlab_microduck.football.arena import FootballArena, MATCH_STEPS, make_football_env_cfg
 from mjlab_microduck.football.cli import SKILL_FILES, bundle_paths, file_hash
-from mjlab_microduck.football.pool import OpponentChoice, OpponentPool
+from mjlab_microduck.football.pool import OpponentChoice, OpponentPool, actor_input
 from mjlab_microduck.football.skills import FrozenSkillPolicy
 from mjlab_microduck.football.wrapper import FootballVecEnv
 
@@ -185,7 +186,9 @@ def evaluate(args: argparse.Namespace) -> dict:
         obs = wrapped.get_observations()
         max_steps = MATCH_STEPS * (math.ceil(args.matches / num_envs) + 1)
         for _ in range(max_steps):
-            action = learner(obs)
+            action = learner(TensorDict(
+                {"actor": actor_input(learner, obs["actor"])}, batch_size=[num_envs],
+            ))
             obs, _, _, extras = wrapped.step(action)
             completed = extras["completed"]
             done_ids = completed["env_ids"].detach().cpu().tolist()
@@ -209,7 +212,7 @@ def evaluate(args: argparse.Namespace) -> dict:
             if done_ids:
                 obs = wrapped.get_observations()
         else:
-            raise RuntimeError("evaluation did not complete all matches within its step bound")
+            raise RuntimeError("evaluation step budget exhausted before every match completed")
     finally:
         wrapped.close()
     return _summary(records, checkpoint, opponent_path, args.seed)

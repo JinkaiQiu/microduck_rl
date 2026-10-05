@@ -16,6 +16,11 @@ import torch
 from torch import nn
 
 
+# Ball placement used by the blind right-foot skill and tactical shaping.
+KICK_BALL_OFFSET_BODY_XY = (0.09, -0.042)
+KICK_READY_HALF_WIDTH_M = 0.018
+
+
 class FrozenSkillPolicy(nn.Module):
     """Deterministic PyTorch inference from a standard rsl_rl MLP checkpoint.
 
@@ -108,7 +113,7 @@ class FootballSkills:
         self.num_envs = num_envs
         self.dt = dt
         self.device = torch.device(device)
-        self.kick_steps = max(1, math.ceil(3.0 / dt))
+        self.kick_steps = max(1, math.ceil(0.6 / dt))
         self.kick_remaining = torch.zeros(num_envs, dtype=torch.long, device=device)
 
     @classmethod
@@ -169,10 +174,10 @@ class FootballSkills:
         ball_x, ball_y = ball_body_xy.unbind(-1)
         # The blind right-foot kick actor was trained with the ball centered at
         # (0.09, -0.042) m in body coordinates, with ±0.015 m placement noise.
-        # A broad gate started long 3-second kick sequences when the foot could
+        # A broad gate started kick sequences when the foot could
         # not reach the ball, leaving the scripted opponent seemingly frozen.
-        ready = (ball_x - 0.09).abs() <= 0.018
-        ready &= (ball_y + 0.042).abs() <= 0.018
+        ready = (ball_x - KICK_BALL_OFFSET_BODY_XY[0]).abs() <= KICK_READY_HALF_WIDTH_M
+        ready &= (ball_y - KICK_BALL_OFFSET_BODY_XY[1]).abs() <= KICK_READY_HALF_WIDTH_M
         start = (action[:, 3] > 0.0) & ready & ~fallen & (self.kick_remaining[env_ids] == 0)
         self.kick_remaining[env_ids[start]] = self.kick_steps
         active_kick = self.kick_remaining[env_ids] > 0
@@ -199,13 +204,13 @@ class FootballSkills:
 def teacher_targets(
     tactical_policy: Callable[[torch.Tensor], torch.Tensor],
     controller: FootballSkills,
-    actor_obs64: torch.Tensor,
+    actor_obs: torch.Tensor,
     obs61: torch.Tensor,
     ball_body_xy: torch.Tensor,
     env_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Label the student's current pre-action states; no physics is advanced."""
-    if actor_obs64.ndim != 2 or actor_obs64.shape != (obs61.shape[0], 64):
-        raise ValueError("Expected 64D football actor observations")
-    tactics = tactical_policy(actor_obs64)
+    if actor_obs.ndim != 2 or actor_obs.shape[0] != obs61.shape[0] or actor_obs.shape[1] not in (64, 66):
+        raise ValueError("Expected 64D or 66D football actor observations")
+    tactics = tactical_policy(actor_obs)
     return controller.act(tactics, obs61, ball_body_xy, env_ids)

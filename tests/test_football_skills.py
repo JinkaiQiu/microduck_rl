@@ -67,14 +67,14 @@ def test_scripted_baseline_positions_ball_before_requesting_kick():
 
 
 def test_scripted_failed_kick_falls_back_to_walking_until_kickoff():
-    guard = ScriptedKickGuard(2, torch.device("cpu"), kick_steps=150)
+    guard = ScriptedKickGuard(2, torch.device("cpu"), kick_steps=30)
     ids = torch.tensor([1])
     ball = torch.tensor([[0.0, 0.0]])
-    remaining = torch.tensor([0, 149])
+    remaining = torch.tensor([0, 29])
     guard.after_action(ids, ball, torch.tensor([0]), remaining)
     assert guard.tracking[1] and not guard.failed[1]
 
-    remaining[1] = 100  # One second of kick actions made no ball contact.
+    remaining[1] = 0  # The 0.6-second kick finished without moving the ball.
     guard.before_action(ids, ball, remaining)
     assert guard.failed[1] and remaining[1] == 0
     obs = torch.zeros(1, 64)
@@ -92,7 +92,7 @@ def test_scripted_failed_kick_falls_back_to_walking_until_kickoff():
 
 
 def test_scripted_near_ball_stall_enters_dribble_fallback_without_a_kick():
-    guard = ScriptedKickGuard(1, torch.device("cpu"), kick_steps=150)
+    guard = ScriptedKickGuard(1, torch.device("cpu"), kick_steps=30)
     ids = torch.tensor([0])
     remaining = torch.tensor([0])
     ball = torch.tensor([[0.0, 0.0]])
@@ -104,14 +104,14 @@ def test_scripted_near_ball_stall_enters_dribble_fallback_without_a_kick():
     assert not guard.stalled[0] and guard.stall_steps[0] == 0
 
 def test_scripted_kick_guard_keeps_a_kick_that_moves_the_ball():
-    guard = ScriptedKickGuard(1, torch.device("cpu"), kick_steps=150)
+    guard = ScriptedKickGuard(1, torch.device("cpu"), kick_steps=30)
     ids = torch.tensor([0])
-    remaining = torch.tensor([149])
+    remaining = torch.tensor([29])
     guard.after_action(ids, torch.tensor([[0.0, 0.0]]), torch.tensor([0]), remaining)
-    remaining[0] = 100
+    remaining[0] = 15
     guard.before_action(ids, torch.tensor([[0.02, 0.0]]), remaining)
     assert not guard.failed[0]
-    assert remaining[0] == 100
+    assert remaining[0] == 15
     assert not guard.tracking[0]
 
 def test_kick_gate_commitment_and_per_env_reset():
@@ -123,8 +123,12 @@ def test_kick_gate_commitment_and_per_env_reset():
     in_reach = torch.tensor([[0.09, -0.04]])
     assert controller.act(request, obs, out_of_reach, ids)[0, 0] == 1
     assert controller.act(request, obs, in_reach, ids)[0, 0] == 2
-    assert controller.kick_remaining.tolist() == [0, 149]
-    assert controller.act(torch.zeros_like(request), obs, out_of_reach, ids)[0, 0] == 2
+    assert controller.kick_steps == 30
+    assert controller.kick_remaining.tolist() == [0, 29]
+    for _ in range(29):
+        assert controller.act(torch.zeros_like(request), obs, out_of_reach, ids)[0, 0] == 2
+    assert controller.kick_remaining[1] == 0
+    assert controller.act(torch.zeros_like(request), obs, out_of_reach, ids)[0, 0] == 1
     controller.reset(ids)
     assert controller.act(torch.zeros_like(request), obs, out_of_reach, ids)[0, 0] == 1
     assert controller.kick_remaining.tolist() == [0, 0]
@@ -139,11 +143,11 @@ def test_teacher_labels_student_state_without_touching_other_controller():
                              obs64, obs, torch.tensor([[0.09, -0.04]]))
     assert target.shape == (1, 14)
     assert target[0, 0] == 2
-    assert teacher.kick_remaining.item() == 149
+    assert teacher.kick_remaining.item() == 29
     assert live.kick_remaining.item() == 0
     resumed, _, _, _ = _controller(num_envs=1)
     resumed.load_state_dict(teacher.state_dict())
-    assert resumed.kick_remaining.item() == 149
+    assert resumed.kick_remaining.item() == 29
 
 
 def test_checkpoint_loader_uses_actor_normalizer_and_elu(tmp_path):

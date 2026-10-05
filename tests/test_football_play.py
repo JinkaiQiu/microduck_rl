@@ -11,7 +11,7 @@ from rsl_rl.models import MLPModel
 from mjlab.envs import ManagerBasedRlEnv
 
 from mjlab_microduck.football.appearance import OPPONENT_COLORS
-from mjlab_microduck.football.arena import FootballArena, MATCH_STEPS, make_football_env_cfg
+from mjlab_microduck.football.arena import BALL_RADIUS, FootballArena, FIELD_HALF_LENGTH, FORFEIT_REWARD, make_football_env_cfg
 from mjlab_microduck.football.cli import ACTOR_CFG
 from mjlab_microduck.football.play import FootballPlayEnv, TacticalKeyboard, TerminalKeys
 from mjlab_microduck.football.pool import OpponentChoice, OpponentPool
@@ -64,27 +64,35 @@ def test_learned_opponent_and_human_seat_survive_match_reset():
             base.sim.mj_model.mat_rgba[palette.material_ids["home"], :3],
             np.broadcast_to(OPPONENT_COLORS["joint"], (len(palette.material_ids["home"]), 3)),
         )
-        play.arena.elapsed[0] = MATCH_STEPS - 1
+        ball = base.scene["ball"]
+        ball_state = ball.data.default_root_state[:1].clone()
+        ball_state[:, :3] = base.scene.env_origins[:1]
+        ball_state[:, 0] += play.arena.field_half_length[0] + BALL_RADIUS + 0.08
+        ball_state[:, 2] += BALL_RADIUS
+        ball.write_root_state_to_sim(ball_state, env_ids=torch.tensor([0]))
+        base.scene.write_data_to_sim()
+        base.sim.forward()
         _, _, done, extras = play.step(torch.zeros(1, 4))
         assert done[0]
         assert extras["completed"]["env_ids"].tolist() == [0]
         assert play.opponent_choices[0] == choice
         assert not bool(play.learner_home[0])
         assert play.arena.elapsed[0] == 0
-        # A learner forfeit overrides a winning goal score.
-        play.arena.scores[0] = torch.tensor([0, 3])
+        # A learner forfeit ends the fresh match without a goal.
+        assert play.arena.scores[0].tolist() == [0, 0]
         robot = base.scene["away"]
         ids = torch.tensor([0])
         state = robot.data.default_root_state[ids].clone()
         state[:, :3] = base.scene.env_origins[ids]
-        state[:, 0] += 1.2
+        state[:, 0] += play.arena.field_half_length[0] - 0.025
         state[:, 2] += 0.115
+        state[:, 7] = 6.0  # Cross the east goal opening during this control step.
         robot.write_root_state_to_sim(state, env_ids=ids)
         base.scene.write_data_to_sim()
         base.sim.forward()
         _, reward, done, extras = play.step(torch.zeros(1, 4))
         assert done[0]
-        assert reward[0] == -15
+        assert reward[0] == -FORFEIT_REWARD
         assert extras["completed"]["points"].tolist() == [0.0]
         assert extras["completed"]["own_out_of_bounds"].tolist() == [True]
         assert extras["completed"]["opponent_out_of_bounds"].tolist() == [False]

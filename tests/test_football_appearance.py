@@ -27,3 +27,7 @@ def test_opponent_palette_preserves_learner_materials_after_side_swap():
         np.testing.assert_allclose(tinted[:, :3],
                                    np.broadcast_to(OPPONENT_COLORS[kind], tinted[:, :3].shape))
         np.testing.assert_allclose(tinted[:, 3], original[opponent_side][:, 3])
+
+    appearance.set_roles(True, "live")
+    for side in ("home", "away"):
+        np.testing.assert_allclose(model.mat_rgba[appearance.material_ids[side]], original[side])

@@ -21,7 +21,9 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlOnPolicyRunnerCfg
 
 from mjlab_microduck.football.arena import FootballArena, make_football_env_cfg
-from mjlab_microduck.football.learning import warm_start_joint_actor_from_walk
+from mjlab_microduck.football.learning import (
+    expand_football_checkpoint_observations, warm_start_joint_actor_from_walk,
+)
 from mjlab_microduck.football.pool import OpponentChoice, OpponentPool
 from mjlab_microduck.football.runner import FootballRunner
 from mjlab_microduck.football.skills import FrozenSkillPolicy
@@ -38,6 +40,15 @@ ACTOR_CFG = {
         "class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"
     },
 }
+TACTICAL_ACTOR_CFG = deepcopy(ACTOR_CFG)
+TACTICAL_ACTOR_CFG["distribution_cfg"] = {
+    "class_name": "mjlab_microduck.football.distribution.TanhGaussianDistribution",
+    "init_std": 0.6,
+    "std_type": "scalar",
+    "limits": (0.4, 0.3, 1.0, 1.0),
+}
+
+
 CRITIC_CFG = {
     "class_name": "MLPModel",
     "hidden_dims": (512, 256, 128),
@@ -88,7 +99,7 @@ def train_config(stage: str, iterations: int, seed: int, logger: str) -> dict:
         "logger": logger,
         "wandb_project": "mjlab_microduck",
         "obs_groups": {"actor": ("actor",), "critic": ("critic",)},
-        "actor": deepcopy(ACTOR_CFG),
+        "actor": deepcopy(TACTICAL_ACTOR_CFG if stage in ("solo", "tactics") else ACTOR_CFG),
         "critic": deepcopy(CRITIC_CFG),
     })
     config["algorithm"].update({
@@ -124,6 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--walk-checkpoint", type=Path)
             command.add_argument("--kick-checkpoint", type=Path)
             command.add_argument("--recovery-checkpoint", type=Path)
+            command.add_argument("--solo-iterations", type=int, default=1000,
+                                 help="one-duck warmup updates before two-duck self-play (default: 1000)")
         elif stage == "distill":
             command.add_argument("--teacher-checkpoint", type=Path)
         else:
@@ -132,11 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _source_checkpoint(stage: str, args, run_dir: Path) -> Path | None:
+    if stage == "tactics":
+        return None
     if args.resume:
         copied = run_dir / ("teacher.pt" if stage == "distill" else "student_init.pt")
         return copied if copied.exists() else None
-    path = args.teacher_checkpoint if stage == "distill" else args.init_checkpoint if stage == "joint" else None
-    if stage != "tactics" and path is None:
+    path = (args.teacher_checkpoint if stage == "distill" else
+            args.init_checkpoint if stage == "joint" else None)
+    if stage in ("distill", "joint") and path is None:
         raise ValueError(f"{stage} requires a source checkpoint")
     if path is None:
         return None
@@ -148,6 +164,67 @@ def _source_checkpoint(stage: str, args, run_dir: Path) -> Path | None:
     return copied
 
 
+
+def _run_solo_phase(
+    args, run_dir: Path, skills: tuple, skill_hashes: dict[str, str],
+    device: torch.device, resume_path: Path | None = None,
+) -> tuple[Path, dict]:
+    """Warm up the tactical actor in a real one-duck world before self-play."""
+    solo_dir = run_dir / "solo"
+    solo_dir.mkdir(parents=True, exist_ok=True)
+    config = train_config("solo", args.solo_iterations, args.seed, args.logger)
+    env_cfg = make_football_env_cfg(args.num_envs, seed=args.seed, solo=True)
+    if args.debug_numerics:
+        env_cfg.sim.nan_guard.enabled = True
+        env_cfg.sim.nan_guard.buffer_size = 20
+        env_cfg.sim.nan_guard.output_dir = str((solo_dir / "nan_dumps").resolve())
+    base_env = ManagerBasedRlEnv(
+        cfg=env_cfg, device=str(device),
+        render_mode="rgb_array" if args.video_every else None,
+    )
+    recorder = None
+    video_end_step = {"value": args.solo_iterations * config["num_steps_per_env"]}
+    if args.video_every:
+        period = args.video_every * config["num_steps_per_env"]
+
+        def start_video(step: int) -> bool:
+            if step % period:
+                return False
+            recorder.video_length = min(args.video_steps, video_end_step["value"] - step)
+            return True
+
+        recorder = FootballVideoRecorder(
+            base_env,
+            video_folder=run_dir / "videos" / "solo",
+            step_trigger=start_video,
+            video_length=args.video_steps,
+            name_prefix="football-solo",
+        )
+    game_env = recorder if recorder is not None else base_env
+    wrapped = FootballVecEnv(
+        FootballArena(game_env, debug_numerics=args.debug_numerics),
+        "solo", None, skills,
+    )
+    if recorder is not None:
+        recorder.football_env = wrapped
+    runner = FootballRunner(
+        wrapped, config, str(solo_dir), str(device), TACTICAL_ACTOR_CFG, skill_hashes,
+    )
+    try:
+        if resume_path is not None:
+            runner.load(str(resume_path))
+            if recorder is not None:
+                recorder.step_count = runner.current_learning_iteration * config["num_steps_per_env"]
+                video_end_step["value"] = recorder.step_count + args.solo_iterations * config["num_steps_per_env"]
+                recorder.name_prefix = f"football-solo-resume-{uuid.uuid4().hex[:8]}"
+        if args.solo_iterations:
+            runner.learn(args.solo_iterations, init_at_random_ep_len=False)
+        final_path = solo_dir / "solo_final.pt"
+        runner.save(str(final_path))
+    finally:
+        wrapped.close()
+    return final_path, torch.load(final_path, map_location="cpu", weights_only=False)
+
 def run(args) -> Path:
     if args.num_envs < 1 or args.iterations < 1:
         raise ValueError("num-envs and iterations must both be positive")
@@ -156,11 +233,27 @@ def run(args) -> Path:
     if args.video_every and args.video_steps > args.video_every * 24:
         raise ValueError("video-steps cannot exceed the recording interval (video-every * 24)")
     stage = args.stage
+    if stage == "tactics" and args.solo_iterations < 0:
+        raise ValueError("solo-iterations must be nonnegative")
+    solo_resume_path = None
+    resume_meta = None
     if args.resume:
-        resume_path = args.resume.resolve()
-        run_dir = resume_path.parent
-        if not resume_path.is_file():
-            raise FileNotFoundError(resume_path)
+        requested_resume = args.resume.resolve()
+        if not requested_resume.is_file():
+            raise FileNotFoundError(requested_resume)
+        resume_meta = torch.load(requested_resume, map_location="cpu", weights_only=False)["football"]
+        if stage == "tactics" and resume_meta["stage"] == "solo":
+            solo_resume_path = requested_resume
+            resume_path = None
+            run_dir = requested_resume.parent.parent
+            if any(run_dir.glob("model_*.pt")):
+                raise ValueError(
+                    "cannot resume solo warmup after tactical self-play has begun; "
+                    "resume a tactics checkpoint instead"
+                )
+        else:
+            resume_path = requested_resume
+            run_dir = requested_resume.parent
     else:
         label = args.run_name or f"seed-{args.seed}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
         run_dir = Path("logs") / "football" / stage / label
@@ -169,7 +262,8 @@ def run(args) -> Path:
         run_dir.mkdir(parents=True)
         resume_path = None
 
-    original_source = (args.teacher_checkpoint if stage == "distill" else args.init_checkpoint if stage == "joint" else None)
+    original_source = (args.teacher_checkpoint if stage == "distill" else
+                       args.init_checkpoint if stage == "joint" else None)
     original_source = original_source.resolve() if original_source is not None else None
     source = _source_checkpoint(stage, args, run_dir)
     source_state = torch.load(source, map_location="cpu", weights_only=False) if source else None
@@ -177,9 +271,8 @@ def run(args) -> Path:
     if source and (not source_meta or (stage == "distill" and source_meta["stage"] != "tactics")
                    or (stage == "joint" and source_meta["stage"] != "distill")):
         raise ValueError("source checkpoint is from the wrong football stage")
-    if resume_path:
-        resume_meta = torch.load(resume_path, map_location="cpu", weights_only=False)["football"]
-        if resume_meta["stage"] != stage:
+    if args.resume:
+        if resume_meta["stage"] not in ((stage, "solo") if stage == "tactics" else (stage,)):
             raise ValueError("cannot resume a different football stage")
         skill_hashes = {name: file_hash(path) for name, path in bundle_paths(run_dir).items()}
         if skill_hashes != resume_meta["skill_hashes"]:
@@ -198,9 +291,13 @@ def run(args) -> Path:
     device = torch.device(args.device)
     skill_paths = bundle_paths(run_dir)
     skills = tuple(FrozenSkillPolicy.from_checkpoint(skill_paths[name], device) for name in SKILL_FILES)
+    if stage == "tactics" and resume_path is None and (args.solo_iterations or solo_resume_path):
+        source, source_state = _run_solo_phase(
+            args, run_dir, skills, skill_hashes, device, solo_resume_path,
+        )
     pool = OpponentPool(seed=args.seed)
     teacher_model = None
-    if source_state:
+    if source_state and stage in ("distill", "joint"):
         pool.load_state_dict(source_meta["env_state"]["pool"])
         if stage == "distill":
             uid = pool.add_state("tactical", source_state["actor_state_dict"], source_meta["actor_cfg"], source_state["iter"])
@@ -238,13 +335,14 @@ def run(args) -> Path:
     game_env = recorder if recorder is not None else base_env
     wrapped = FootballVecEnv(
         FootballArena(game_env, debug_numerics=args.debug_numerics),
-        stage, pool, skills, teacher_model, seed=args.seed,
+        stage, pool, skills, teacher_model, seed=args.seed, dual_rollouts=True,
     )
     if recorder is not None:
         recorder.football_env = wrapped
     runner = FootballRunner(
         wrapped, config, str(run_dir), str(device),
-        ACTOR_CFG, skill_hashes, str(source) if source else None,
+        TACTICAL_ACTOR_CFG if stage == "tactics" else ACTOR_CFG,
+        skill_hashes, str(source) if source else None,
     )
     try:
         if resume_path:
@@ -253,9 +351,13 @@ def run(args) -> Path:
                 recorder.step_count = runner.current_learning_iteration * config["num_steps_per_env"]
                 video_end_step["value"] = recorder.step_count + args.iterations * config["num_steps_per_env"]
                 recorder.name_prefix = f"football-{stage}-resume-{uuid.uuid4().hex[:8]}"
+        elif stage == "tactics" and source_state is not None:
+            runner.alg.actor.load_state_dict(source_state["actor_state_dict"], strict=True)
+            runner.alg.critic.load_state_dict(source_state["critic_state_dict"], strict=True)
         elif stage == "distill":
             warm_start_joint_actor_from_walk(runner.alg.actor, skill_paths["walk"])
         elif stage == "joint":
+            expand_football_checkpoint_observations(source_state, runner.alg.actor)
             runner.alg.actor.load_state_dict(source_state["actor_state_dict"], strict=True)
         runner.learn(args.iterations, init_at_random_ep_len=False)
     finally:

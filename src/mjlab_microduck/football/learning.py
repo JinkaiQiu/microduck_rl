@@ -21,6 +21,7 @@ class TeacherTargetStorage(RolloutStorage):
     def __init__(self, num_envs, num_steps, obs, action_shape, device="cpu"):
         super().__init__("rl", num_envs, num_steps, obs, action_shape, device)
         self.teacher_targets = torch.zeros_like(self.actions)
+        self.valid = torch.ones((num_steps, num_envs), device=device, dtype=torch.bool)
 
     def add_transition(self, transition):
         if transition.privileged_actions is None:
@@ -28,14 +29,19 @@ class TeacherTargetStorage(RolloutStorage):
         if transition.privileged_actions.shape != self.teacher_targets[self.step].shape:
             raise ValueError("teacher target shape does not match learner actions")
         self.teacher_targets[self.step].copy_(transition.privileged_actions)
+        valid = getattr(transition, "valid_mask", None)
+        if valid is None:
+            valid = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        if valid.shape != (self.num_envs,):
+            raise ValueError("live-seat mask must have one entry per rollout row")
+        self.valid[self.step].copy_(valid)
         super().add_transition(transition)
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        """Yield the same shuffled indices for PPO data and teacher targets."""
-        batch_size = self.num_envs * self.num_transitions_per_env
-        if batch_size % num_mini_batches:
-            raise ValueError("rollout size must be divisible by num_mini_batches")
-        mini_batch_size = batch_size // num_mini_batches
+        """Shuffle only executed live-policy actions, keeping targets aligned."""
+        indices = self.valid.flatten().nonzero(as_tuple=False).squeeze(-1)
+        if not indices.numel():
+            raise ValueError("a football rollout has no live-policy transitions")
         observations = self.observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
@@ -45,9 +51,10 @@ class TeacherTargetStorage(RolloutStorage):
         old_params = tuple(p.flatten(0, 1) for p in self.distribution_params)
         targets = self.teacher_targets.flatten(0, 1)
         for _ in range(num_epochs):
-            indices = torch.randperm(batch_size, device=self.device)
-            for i in range(num_mini_batches):
-                idx = indices[i * mini_batch_size : (i + 1) * mini_batch_size]
+            shuffled = indices[torch.randperm(len(indices), device=self.device)]
+            for idx in torch.tensor_split(shuffled, num_mini_batches):
+                if not idx.numel():
+                    continue
                 yield RolloutStorage.Batch(
                     observations=observations[idx],
                     actions=actions[idx],
@@ -101,8 +108,8 @@ class FootballPPO(PPO):
             storage.actions_shape,
             storage.device,
         )
-        if teacher_loss_coef_start and (self.actor.is_recurrent or self.critic.is_recurrent or self.symmetry or self.rnd):
-            raise ValueError("teacher-guided football PPO supports feedforward actors without RND or symmetry")
+        if self.actor.is_recurrent or self.critic.is_recurrent or self.symmetry or self.rnd:
+            raise ValueError("football PPO supports feedforward actors without RND or symmetry")
 
     def set_iteration(self, iteration: int) -> None:
         if iteration < 0:
@@ -136,24 +143,54 @@ class FootballPPO(PPO):
             if self.teacher_loss_coef:
                 raise RuntimeError("teacher targets are required for every distillation step")
             self.transition.privileged_actions = torch.zeros_like(self.transition.actions)
-        super().process_env_step(obs, rewards, dones, extras)
+        valid = extras.get("learner_mask")
+        if valid is None:
+            valid = torch.ones(len(rewards), device=self.device, dtype=torch.bool)
+        valid = valid.to(device=self.device, dtype=torch.bool)
+        if valid.shape != (len(rewards),):
+            raise ValueError("live-seat mask must match the rollout batch")
+        self.transition.valid_mask = valid
+        # Frozen seats are observed for action routing but never train the
+        # actor, critic, their normalizers, or the teacher-guidance loss.
+        live_obs = self.transition.observations[valid]
+        self.actor.update_normalization(live_obs)
+        self.critic.update_normalization(live_obs)
+        self.transition.rewards = rewards.clone()
+        self.transition.dones = dones
+        if "time_outs" in extras:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1,
+            )
+        self.storage.add_transition(self.transition)
+        self.transition.clear()
+        self.actor.reset(dones)
+        self.critic.reset(dones)
+
+    def compute_returns(self, obs):
+        """Compute GAE per seat, normalizing using executed actions only."""
+        st = self.storage
+        last_values = self.critic(obs).detach()
+        advantage = 0
+        for step in reversed(range(st.num_transitions_per_env)):
+            next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+            not_done = 1.0 - st.dones[step].float()
+            delta = st.rewards[step] + not_done * self.gamma * next_values - st.values[step]
+            advantage = delta + not_done * self.gamma * self.lam * advantage
+            st.returns[step] = advantage + st.values[step]
+        st.advantages = st.returns - st.values
+        if not self.normalize_advantage_per_mini_batch:
+            live = st.advantages[st.valid]
+            st.advantages = (st.advantages - live.mean()) / (live.std(unbiased=False) + 1e-8)
 
     def update(self) -> dict[str, float]:
         self.set_iteration(self.update_count)
-        if self.teacher_loss_coef == 0:
-            result = super().update()
-            result["teacher"] = 0.0
-            result["teacher_coef"] = 0.0
-            self.update_count += 1
-            if self.after_update is not None:
-                self.after_update(self.update_count)
-            return result
-
         if self.actor.is_recurrent or self.critic.is_recurrent or self.symmetry or self.rnd:
-            raise ValueError("teacher-guided football PPO supports feedforward actors without RND or symmetry")
+            raise ValueError("football PPO supports feedforward actors without RND or symmetry")
         means = {"value": 0.0, "surrogate": 0.0, "entropy": 0.0, "teacher": 0.0}
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        batches = 0
         for batch in generator:
+            batches += 1
             if self.normalize_advantage_per_mini_batch:
                 batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             self.actor(batch.observations, stochastic_output=True)
@@ -180,7 +217,10 @@ class FootballPPO(PPO):
                 value_loss = torch.maximum((values - batch.returns).square(), (value_clipped - batch.returns).square()).mean()
             else:
                 value_loss = (values - batch.returns).square().mean()
-            teacher_loss = F.huber_loss(self.actor.output_mean, batch.privileged_actions)
+            teacher_loss = (
+                F.huber_loss(self.actor.output_mean, batch.privileged_actions)
+                if self.teacher_loss_coef else self.actor.output_mean.new_zeros(())
+            )
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
             loss = loss + self.teacher_loss_coef * teacher_loss
             self.optimizer.zero_grad()
@@ -192,7 +232,7 @@ class FootballPPO(PPO):
             self.optimizer.step()
             for key, value in (("value", value_loss), ("surrogate", surrogate_loss), ("entropy", entropy), ("teacher", teacher_loss)):
                 means[key] += value.item()
-        n = self.num_learning_epochs * self.num_mini_batches
+        n = batches
         self.storage.clear()
         self.update_count += 1
         if self.after_update is not None:
@@ -214,7 +254,7 @@ class FootballPPO(PPO):
 
 
 def warm_start_joint_actor_from_walk(student_actor, walk_checkpoint: str | Path | dict) -> None:
-    """Transfer 48 proprio weights into a 64D joint actor and zero game weights.
+    """Transfer 48 proprio weights into a 66D joint actor and zero game weights.
 
     The walk checkpoint must have matching hidden and 14D output layers.  Its
     first 48 observation columns are the same ordered proprioception contract.
@@ -229,8 +269,8 @@ def warm_start_joint_actor_from_walk(student_actor, walk_checkpoint: str | Path 
     first_weight = "mlp.0.weight"
     old = source[first_weight]
     new = destination[first_weight]
-    if old.shape[0] != new.shape[0] or old.shape[1] < 48 or new.shape[1] != 64:
-        raise ValueError("walk/student first layers must have matching width and at least 48/64 input columns")
+    if old.shape[0] != new.shape[0] or old.shape[1] < 48 or new.shape[1] != 66:
+        raise ValueError("walk/student first layers must have matching width and at least 48/66 input columns")
     new[:, :48] = old[:, :48].to(device=new.device, dtype=new.dtype)
     new[:, 48:] = 0
     for key, value in destination.items():
@@ -246,8 +286,65 @@ def warm_start_joint_actor_from_walk(student_actor, walk_checkpoint: str | Path 
             if key in source:
                 value.copy_(source[key])
         elif key in source:
-            if value.shape[-1] != 64 or source[key].shape[-1] < 48:
+            if value.shape[-1] != 66 or source[key].shape[-1] < 48:
                 raise ValueError(f"walk/student normalizer mismatch at {key}")
             value[..., :48] = source[key][..., :48].to(device=value.device, dtype=value.dtype)
             value[..., 48:] = 0 if key == "obs_normalizer._mean" else 1
     student_actor.load_state_dict(destination)
+
+
+def expand_football_checkpoint_observations(
+    checkpoint: dict, actor, critic=None,
+) -> dict:
+    """Load 64D/82D football networks into the size-aware 66D/84D layout.
+
+    The two field-size features are appended to actor observations and inserted
+    between game and velocity features in critic observations. New first-layer
+    columns start at zero, so a previous policy initially behaves as before.
+    """
+    actor_source = checkpoint["actor_state_dict"]
+    actor_target = actor.state_dict()
+    old_actor_width = actor_source["mlp.0.weight"].shape[1]
+    new_actor_width = actor_target["mlp.0.weight"].shape[1]
+    if old_actor_width == new_actor_width:
+        return checkpoint
+    if (old_actor_width, new_actor_width) != (64, 66):
+        raise ValueError(f"unsupported football actor observation change: {old_actor_width} -> {new_actor_width}")
+
+    def expand(state: dict, target: dict, *, insert_at: int) -> None:
+        for key in ("mlp.0.weight", "obs_normalizer._mean", "obs_normalizer._var", "obs_normalizer._std"):
+            old = state[key]
+            new = target[key].clone().to(device=old.device, dtype=old.dtype)
+            if key in ("obs_normalizer._var", "obs_normalizer._std"):
+                new.fill_(1)
+            else:
+                new.zero_()
+            new[..., :insert_at] = old[..., :insert_at]
+            new[..., insert_at + 2:] = old[..., insert_at:]
+            state[key] = new
+
+    expand(actor_source, actor_target, insert_at=64)
+    if critic is not None:
+        critic_source = checkpoint["critic_state_dict"]
+        critic_target = critic.state_dict()
+        if (critic_source["mlp.0.weight"].shape[1], critic_target["mlp.0.weight"].shape[1]) != (82, 84):
+            raise ValueError("old football critic must expand from 82D to 84D")
+        expand(critic_source, critic_target, insert_at=64)
+        optimizer = checkpoint.get("optimizer_state_dict")
+        if optimizer is not None:
+            actor_shape = (actor_target["mlp.0.weight"].shape[0], 64)
+            critic_shape = (critic_target["mlp.0.weight"].shape[0], 82)
+            for param_state in optimizer["state"].values():
+                for key, value in param_state.items():
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    if tuple(value.shape) == tuple(actor_shape):
+                        expanded = value.new_zeros((value.shape[0], 66))
+                        expanded[:, :64] = value
+                        param_state[key] = expanded
+                    elif tuple(value.shape) == tuple(critic_shape):
+                        expanded = value.new_zeros((value.shape[0], 84))
+                        expanded[:, :64] = value[:, :64]
+                        expanded[:, 66:] = value[:, 64:]
+                        param_state[key] = expanded
+    return checkpoint

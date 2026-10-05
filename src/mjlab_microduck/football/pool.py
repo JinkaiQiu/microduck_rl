@@ -20,7 +20,7 @@ PolicyKind = Literal["tactical", "joint"]
 
 @dataclass(frozen=True)
 class OpponentChoice:
-    kind: Literal["scripted", "tactical", "joint"]
+    kind: Literal["live", "scripted", "tactical", "joint"]
     uid: int = -1
 
 
@@ -68,25 +68,32 @@ class OpponentPool:
         return uid
 
     def sample(self, count: int, stage: Literal["tactics", "distill", "joint"]) -> list[OpponentChoice]:
-        """Sample frozen opponents independently for each new match."""
+        """Sample a live second seat or a frozen opponent once per match."""
         out: list[OpponentChoice] = []
         for _ in range(count):
             draw = float(torch.rand((), generator=self._rng))
             if stage == "tactics":
-                kind = "tactical" if self.tactical_count and draw < 0.8 else "scripted"
-            elif stage == "distill":
-                kind = "tactical" if self.tactical_count else "scripted"
-            elif stage == "joint":
-                if self.joint_count == 0:
-                    kind = "tactical" if self.tactical_count else "scripted"
-                elif self.tactical_count == 0:
-                    kind = "joint"
+                # A small scripted anchor remains throughout training. Before
+                # the first snapshot, the other 95% are live self-play.
+                if draw < 0.05:
+                    kind = "scripted"
+                elif self.tactical_count and draw >= 0.65:
+                    kind = "tactical"
                 else:
-                    kind = "tactical" if draw < 0.25 else "joint"
+                    kind = "live"
+            elif stage == "distill":
+                kind = "live" if draw < 0.5 or not self.tactical_count else "tactical"
+            elif stage == "joint":
+                if draw < 0.5 or not (self.tactical_count or self.joint_count):
+                    kind = "live"
+                elif self.tactical_count and self.joint_count:
+                    kind = "tactical" if draw < 0.625 else "joint"
+                else:
+                    kind = "tactical" if self.tactical_count else "joint"
             else:
                 raise ValueError(f"unknown training stage: {stage}")
-            if kind == "scripted":
-                out.append(OpponentChoice("scripted"))
+            if kind in ("scripted", "live"):
+                out.append(OpponentChoice(kind))
             else:
                 recent = self._recent[kind]
                 index = int(torch.randint(len(recent), (), generator=self._rng))
@@ -95,14 +102,15 @@ class OpponentPool:
 
     def model(self, choice: OpponentChoice, device: str | torch.device) -> torch.nn.Module:
         """Build a frozen RSL actor for a selected snapshot, caching per device."""
-        if choice.kind == "scripted":
-            raise ValueError("scripted opponents do not have an actor model")
+        if choice.kind in ("scripted", "live"):
+            raise ValueError(f"{choice.kind} opponents do not have a frozen actor model")
         key = (choice.uid, str(device))
         if key not in self._model_cache:
             from rsl_rl.models import MLPModel
 
             snapshot = self._snapshots[choice.uid]
-            obs = TensorDict({"actor": torch.zeros(1, 64, device=device)}, batch_size=[1])
+            input_width = snapshot["actor_state_dict"]["mlp.0.weight"].shape[1]
+            obs = TensorDict({"actor": torch.zeros(1, input_width, device=device)}, batch_size=[1])
             cfg = deepcopy(snapshot["actor_cfg"])
             cfg.pop("class_name", None)
             model = MLPModel(
@@ -143,3 +151,13 @@ class OpponentPool:
         self._recent = deepcopy(state["recent"])
         self._rng.set_state(state["rng_state"].cpu())
         self._model_cache.clear()
+
+
+def actor_input(model: torch.nn.Module, observations: torch.Tensor) -> torch.Tensor:
+    """Select the input contract recorded by a frozen actor snapshot."""
+    if not hasattr(model, "mlp"):
+        return observations
+    width = model.mlp[0].in_features
+    if observations.shape[-1] < width:
+        raise ValueError(f"actor needs {width} features; environment supplies {observations.shape[-1]}")
+    return observations[..., :width]
