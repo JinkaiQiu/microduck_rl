@@ -8,7 +8,8 @@ Evaluation and keyboard play retain their single-seat interface.
 from __future__ import annotations
 
 from collections import deque
-from typing import Literal
+from copy import deepcopy
+from typing import Callable, Literal
 
 import torch
 from rsl_rl.env import VecEnv
@@ -147,7 +148,11 @@ class FootballVecEnv(VecEnv):
         teacher_model: torch.nn.Module | None = None,
         seed: int = 42,
         dual_rollouts: bool = False,
+        train_skills: bool = False,
+        skill_sampler: Callable | None = None,
     ) -> None:
+        if train_skills and stage not in ("solo", "tactics"):
+            raise ValueError("skill training requires the solo or tactics stage")
         expected_players = 1 if stage == "solo" else 2
         if arena.num_players != expected_players:
             raise ValueError(f"{stage} stage requires {expected_players} physical player(s)")
@@ -169,7 +174,18 @@ class FootballVecEnv(VecEnv):
         self.num_actions = 4 if stage in ("solo", "tactics") else 14
         self.max_episode_length = MATCH_STEPS
         self.cfg = self.env.cfg
-        self.learner_skills = FootballSkills(*skill_policies, self.num_matches, device=self.device)
+        self.train_skills = train_skills
+        self.skill_sampler = skill_sampler
+        self.last_skill_transition: dict[str, torch.Tensor] | None = None
+        self.base_skills = tuple(skill_policies)
+        learner_policies = deepcopy(self.base_skills) if train_skills else self.base_skills
+        if train_skills:
+            for policy in learner_policies:
+                if isinstance(policy, torch.nn.Module):
+                    policy.requires_grad_(True)
+        self.learner_skills = FootballSkills(*learner_policies, self.num_matches, device=self.device)
+        self.live_opponent_skills = FootballSkills(*learner_policies, self.num_matches, device=self.device)
+        self._frozen_skill_controllers: dict[int, FootballSkills] = {}
         if stage != "solo":
             self.learner_home = torch.zeros(self.num_matches, device=self.device, dtype=torch.bool)
             self.opponent_choices = [OpponentChoice("scripted") for _ in range(self.num_matches)]
@@ -230,10 +246,17 @@ class FootballVecEnv(VecEnv):
             self.refresh_appearance()
         self.learner_skills.reset(ids)
         self.opponent_skills.reset(ids)
+        self.live_opponent_skills.reset(ids)
+        for controller in self._frozen_skill_controllers.values():
+            controller.reset(ids)
         teacher_ids = torch.cat((ids, ids + self.num_matches)) if self.dual_rollouts else ids
         self.teacher_skills.reset(teacher_ids)
         self.scripted_kick_guard.reset(ids)
-        self.pool.prune({choice.uid for choice in self.opponent_choices if choice.uid >= 0})
+        active_uids = {choice.uid for choice in self.opponent_choices if choice.uid >= 0}
+        self._frozen_skill_controllers = {
+            uid: controller for uid, controller in self._frozen_skill_controllers.items() if uid in active_uids
+        }
+        self.pool.prune(active_uids)
 
     def _select(self, home: torch.Tensor, away: torch.Tensor, learner: bool) -> torch.Tensor:
         use_home = self.learner_home if learner else ~self.learner_home
@@ -287,6 +310,46 @@ class FootballVecEnv(VecEnv):
             ball_xy = torch.cat((ball_xy, self._selected_ball_xy(False)), dim=0)
         return self.teacher_skills.act(tactics, obs61, ball_xy)
 
+    def consume_skill_transition(self) -> dict[str, torch.Tensor] | None:
+        transition = self.last_skill_transition
+        self.last_skill_transition = None
+        return transition
+
+    def _skill_branch_logs(self, live_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.last_skill_transition is None:
+            return {}
+        branches = self.last_skill_transition["branch"][live_mask]
+        return {
+            f"info/skill_{name}_fraction": (branches == index).float().mean()
+            for index, name in enumerate(("walk", "kick", "recovery"))
+        }
+
+    def _live_skill_action(
+        self, controller: FootballSkills, tactics: torch.Tensor,
+        obs61: torch.Tensor, ball_xy: torch.Tensor,
+        env_ids: torch.Tensor | None = None, rollout_offset: int = 0,
+    ) -> torch.Tensor:
+        if not self.train_skills or self.skill_sampler is None:
+            if env_ids is None:
+                return controller.act(tactics, obs61, ball_xy)
+            return controller.act(tactics, obs61, ball_xy, env_ids)
+        mean, routed_obs, branch = controller.act_with_info(tactics, obs61, ball_xy, env_ids)
+        joint, log_prob = self.skill_sampler(mean, routed_obs, branch)
+        if joint.shape != mean.shape or log_prob.shape != branch.shape:
+            raise ValueError("skill sampler must return (N,14) actions and (N,) log probabilities")
+        if self.last_skill_transition is None:
+            self.last_skill_transition = {
+                "skill_obs": routed_obs.new_zeros((self.num_envs, 61)),
+                "branch": branch.new_zeros(self.num_envs),
+                "joint_actions": joint.new_zeros((self.num_envs, 14)),
+                "old_log_prob": log_prob.new_zeros(self.num_envs),
+            }
+        rows = (torch.arange(len(tactics), device=self.device) if env_ids is None else env_ids) + rollout_offset
+        for name, value in (("skill_obs", routed_obs), ("branch", branch),
+                            ("joint_actions", joint), ("old_log_prob", log_prob)):
+            self.last_skill_transition[name][rows] = value.detach()
+        return joint
+
     @torch.no_grad()
     def _opponent_action(self, opponent_obs: torch.Tensor,
                          live_actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -313,8 +376,11 @@ class FootballVecEnv(VecEnv):
                 if live_actions is None:
                     raise RuntimeError("a live opponent needs its sampled policy action")
                 if self.stage == "tactics":
-                    tactics[ids] = live_actions[ids]
-                    tactical_ids.extend(members)
+                    controller = self.live_opponent_skills if self.train_skills else self.opponent_skills
+                    out[ids] = self._live_skill_action(
+                        controller, live_actions[ids], self._selected_obs61(False)[ids],
+                        self._selected_ball_xy(False)[ids], ids, self.num_matches,
+                    )
                 else:
                     out[ids] = live_actions[ids]
                 continue
@@ -335,8 +401,18 @@ class FootballVecEnv(VecEnv):
             model = self.pool.model(OpponentChoice(kind, uid), self.device)
             values = model(TensorDict({"actor": actor_input(model, opponent_obs[ids])}, batch_size=[len(ids)]))
             if kind == "tactical":
-                tactics[ids] = values
-                tactical_ids.extend(members)
+                if hasattr(self.pool, "skill_controller"):
+                    controller = self.pool.skill_controller(
+                        OpponentChoice(kind, uid), self.base_skills, self.num_matches, self.device,
+                    )
+                    self._frozen_skill_controllers[uid] = controller
+                    out[ids] = controller.act(
+                        values, self._selected_obs61(False)[ids],
+                        self._selected_ball_xy(False)[ids], ids,
+                    )
+                else:
+                    tactics[ids] = values
+                    tactical_ids.extend(members)
             else:
                 out[ids] = values
         if tactical_ids:
@@ -377,6 +453,7 @@ class FootballVecEnv(VecEnv):
         return logs
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        self.last_skill_transition = None
         if actions.shape != (self.num_envs, self.num_actions):
             raise ValueError(f"expected learner actions {(self.num_envs, self.num_actions)}")
         if self.stage == "solo":
@@ -396,7 +473,8 @@ class FootballVecEnv(VecEnv):
         opponent_obs = self._select(self.arena.actor_obs(0), self.arena.actor_obs(1), False)
         with torch.no_grad():
             if self.stage == "tactics":
-                learner_joint = self.learner_skills.act(
+                learner_joint = self._live_skill_action(
+                    self.learner_skills,
                     primary_actions, self._selected_obs61(True), self._selected_ball_xy(True)
                 )
             else:
@@ -408,6 +486,16 @@ class FootballVecEnv(VecEnv):
                 else torch.ones(n, device=self.device, dtype=torch.bool)
             )
             opponent_ready = self.opponent_skills.kick_remaining == 0
+            if self.train_skills and self.stage == "tactics":
+                opponent_ready = torch.where(
+                    live_second, self.live_opponent_skills.kick_remaining == 0, opponent_ready,
+                )
+            for uid, controller in self._frozen_skill_controllers.items():
+                snapshot_rows = torch.tensor(
+                    [choice.kind == "tactical" and choice.uid == uid for choice in self.opponent_choices],
+                    device=self.device, dtype=torch.bool,
+                )
+                opponent_ready = torch.where(snapshot_rows, controller.kick_remaining == 0, opponent_ready)
             direct_opponents = torch.as_tensor(
                 [choice.kind == "joint" or (choice.kind == "live" and self.stage != "tactics")
                  for choice in self.opponent_choices],
@@ -474,6 +562,7 @@ class FootballVecEnv(VecEnv):
                 "info/live_rollout_fraction": live_mask.float().mean(),
                 **self._win_rate_logs(),
                 **reward_component_logs,
+                **self._skill_branch_logs(live_mask),
             },
             "completed": {
                 "env_ids": completed_ids.clone(),
@@ -489,8 +578,8 @@ class FootballVecEnv(VecEnv):
 
     def _step_solo(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         with torch.no_grad():
-            joint = self.learner_skills.act(
-                actions.to(self.device), self.arena.obs61(0), self.arena.ball_body_xy(0),
+            joint = self._live_skill_action(
+                self.learner_skills, actions.to(self.device), self.arena.obs61(0), self.arena.ball_body_xy(0),
             )
             self.arena.set_kick_available((self.learner_skills.kick_remaining == 0).float()[:, None])
             _, side_rewards, dones, info = self.arena.step(joint)
@@ -515,6 +604,7 @@ class FootballVecEnv(VecEnv):
             "reward/total": rewards.mean(),
         }
         logs.update({f"reward/{name}": value[:, 0].mean() for name, value in info["reward_components"].items()})
+        logs.update(self._skill_branch_logs(torch.ones(self.num_envs, device=self.device, dtype=torch.bool)))
         return obs, rewards, dones.long(), {
             "log": logs,
             "completed": {

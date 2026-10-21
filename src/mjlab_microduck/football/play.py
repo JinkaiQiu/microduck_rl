@@ -231,7 +231,8 @@ def run(args: argparse.Namespace) -> None:
     skills = tuple(FrozenSkillPolicy.from_checkpoint(paths[name], device) for name in SKILL_FILES)
     kind = "tactical" if meta["stage"] == "tactics" else "joint"
     pool = OpponentPool(seed=args.seed)
-    uid = pool.add_state(kind, state["actor_state_dict"], meta["actor_cfg"], state["iter"])
+    uid = pool.add_state(kind, state["actor_state_dict"], meta["actor_cfg"],
+                         state["iter"], state.get("skill_state_dicts"))
     opponent = OpponentChoice(kind, uid)
     print(f"Opponent: {meta['stage']} policy from {checkpoint}", flush=True)
     base = ManagerBasedRlEnv(cfg=make_football_env_cfg(1, seed=args.seed), device=str(device))

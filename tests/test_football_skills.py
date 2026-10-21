@@ -43,6 +43,46 @@ def test_action_routing_and_command_bounds():
     torch.testing.assert_close(obs, original_obs)
 
 
+def test_action_info_records_selected_inputs_and_advances_timers_once():
+    controller, walk, kick, recover = _controller(num_envs=5)
+    obs = _obs(3)
+    obs[:, 48:51] = 7
+    obs[2, 3:6] = torch.tensor([1., 0., 0.])
+    original = obs.clone()
+    tactics = torch.tensor([[5., -5., 5., 0.], [0., 0., 0., 1.], [0., 0., 0., 1.]])
+    ball = torch.tensor([[0.09, -0.042]]).expand(3, -1)
+    ids = torch.tensor([4, 1, 3])
+    means, routed_obs, branches = controller.act_with_info(tactics, obs, ball, ids)
+    assert means.shape == (3, 14)
+    assert means[:, 0].tolist() == [1, 2, 3]
+    assert branches.dtype == torch.long
+    assert branches.tolist() == [0, 1, 2]
+    torch.testing.assert_close(routed_obs[:, 48:51], torch.tensor([[0.4, -0.3, 1.], [0., 0., 0.], [0., 0., 0.]]))
+    for branch, skill in enumerate((walk, kick, recover)):
+        assert len(skill.inputs) == 1
+        torch.testing.assert_close(skill.inputs[0], routed_obs[branches == branch])
+    torch.testing.assert_close(obs, original)
+    assert controller.kick_remaining.tolist() == [0, 29, 0, 0, 0]
+    # A continuing kick uses the same route even after the request disappears.
+    means, _, branches = controller.act_with_info(torch.zeros(1, 4), _obs(1), torch.zeros(1, 2), ids[1:2])
+    assert branches.tolist() == [1] and means[0, 0] == 2
+    assert controller.kick_remaining[1] == 28
+    empty = controller.act_with_info(torch.empty(0, 4), _obs(0), torch.empty(0, 2), torch.empty(0, dtype=torch.long))
+    assert [value.shape for value in empty] == [(0, 14), (0, 61), (0,)]
+
+
+def test_skill_can_be_unfrozen_for_training_while_act_keeps_inference_no_grad():
+    actor = FrozenSkillPolicy({"mlp.0.weight": torch.ones(14, 61), "mlp.0.bias": torch.zeros(14)})
+    assert not any(parameter.requires_grad for parameter in actor.parameters())
+    actor.requires_grad_(True)
+    obs = _obs(1)
+    actor(obs).sum().backward()
+    assert actor.mlp[0].weight.grad is not None
+    controller = FootballSkills(actor, actor, actor, num_envs=1)
+    result = controller.act(torch.zeros(1, 4), obs, torch.zeros(1, 2))
+    assert not result.requires_grad
+
+
 def test_scripted_baseline_positions_ball_before_requesting_kick():
     obs = torch.zeros(2, 64)
     obs[:, 56] = 1.0  # Opponent's attacking goal is straight ahead.

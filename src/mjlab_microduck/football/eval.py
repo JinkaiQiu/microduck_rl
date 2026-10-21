@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 import json
 import math
 from pathlib import Path
@@ -18,7 +19,7 @@ from mjlab.utils.wrappers import VideoRecorder
 from mjlab_microduck.football.arena import FootballArena, MATCH_STEPS, make_football_env_cfg
 from mjlab_microduck.football.cli import SKILL_FILES, bundle_paths, file_hash
 from mjlab_microduck.football.pool import OpponentChoice, OpponentPool, actor_input
-from mjlab_microduck.football.skills import FrozenSkillPolicy
+from mjlab_microduck.football.skills import FootballSkills, FrozenSkillPolicy
 from mjlab_microduck.football.wrapper import FootballVecEnv
 
 
@@ -128,7 +129,8 @@ def evaluate(args: argparse.Namespace) -> dict:
     skills = tuple(FrozenSkillPolicy.from_checkpoint(skill_paths[name], device) for name in SKILL_FILES)
     pool = OpponentPool(seed=args.seed)
     learner_kind = "tactical" if meta["stage"] == "tactics" else "joint"
-    learner_uid = pool.add_state(learner_kind, state["actor_state_dict"], meta["actor_cfg"], state["iter"])
+    learner_uid = pool.add_state(learner_kind, state["actor_state_dict"], meta["actor_cfg"],
+                                 state["iter"], state.get("skill_state_dicts"))
     learner = pool.model(OpponentChoice(learner_kind, learner_uid), device)
     opponent_path = args.opponent_checkpoint.resolve() if args.opponent_checkpoint else None
     opponent_choice = OpponentChoice("scripted")
@@ -139,7 +141,8 @@ def evaluate(args: argparse.Namespace) -> dict:
             raise ValueError("opponent uses a different skill bundle")
         opponent_kind = "tactical" if opponent_meta["stage"] == "tactics" else "joint"
         uid = pool.add_state(opponent_kind, opponent_state["actor_state_dict"],
-                             opponent_meta["actor_cfg"], opponent_state["iter"])
+                             opponent_meta["actor_cfg"], opponent_state["iter"],
+                             opponent_state.get("skill_state_dicts"))
         opponent_choice = OpponentChoice(opponent_kind, uid)
     # A distilled student already acts in joint space; it needs no teacher during evaluation.
     stage = "tactics" if learner_kind == "tactical" else "joint"
@@ -153,6 +156,11 @@ def evaluate(args: argparse.Namespace) -> dict:
                              video_length=args.video_steps, name_prefix="football-eval",
                              disable_logger=True)
     wrapped = FootballVecEnv(FootballArena(base), stage, pool, skills, seed=args.seed)
+    if learner_kind == "tactical" and "skill_state_dicts" in state:
+        learner_skills = deepcopy(skills)
+        for name, skill in zip(SKILL_FILES, learner_skills, strict=True):
+            skill.load_state_dict(state["skill_state_dicts"][name])
+        wrapped.learner_skills = FootballSkills(*learner_skills, num_envs, device=device)
     pending = [-1] * num_envs
     next_slot = 0
     records: list[dict | None] = [None] * args.matches

@@ -137,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--recovery-checkpoint", type=Path)
             command.add_argument("--solo-iterations", type=int, default=1000,
                                  help="one-duck warmup updates before two-duck self-play (default: 1000)")
+            command.add_argument("--train-skills", action="store_true",
+                                 help="fine-tune walk, kick, and recovery skills with tactical PPO")
         elif stage == "distill":
             command.add_argument("--teacher-checkpoint", type=Path)
         else:
@@ -203,7 +205,7 @@ def _run_solo_phase(
     game_env = recorder if recorder is not None else base_env
     wrapped = FootballVecEnv(
         FootballArena(game_env, debug_numerics=args.debug_numerics),
-        "solo", None, skills,
+        "solo", None, skills, train_skills=args.train_skills,
     )
     if recorder is not None:
         recorder.football_env = wrapped
@@ -242,6 +244,10 @@ def run(args) -> Path:
         if not requested_resume.is_file():
             raise FileNotFoundError(requested_resume)
         resume_meta = torch.load(requested_resume, map_location="cpu", weights_only=False)["football"]
+        if stage == "tactics":
+            if args.train_skills and not resume_meta.get("train_skills", False):
+                raise ValueError("cannot enable skill fine-tuning when resuming a frozen-skill run")
+            args.train_skills = bool(resume_meta.get("train_skills", False))
         if stage == "tactics" and resume_meta["stage"] == "solo":
             solo_resume_path = requested_resume
             resume_path = None
@@ -295,12 +301,19 @@ def run(args) -> Path:
         source, source_state = _run_solo_phase(
             args, run_dir, skills, skill_hashes, device, solo_resume_path,
         )
+        if args.train_skills:
+            for name, skill in zip(SKILL_FILES, skills, strict=True):
+                skill.load_state_dict(source_state["skill_state_dicts"][name])
+    elif stage == "distill" and source_state and "skill_state_dicts" in source_state:
+        for name, skill in zip(SKILL_FILES, skills, strict=True):
+            skill.load_state_dict(source_state["skill_state_dicts"][name])
     pool = OpponentPool(seed=args.seed)
     teacher_model = None
     if source_state and stage in ("distill", "joint"):
         pool.load_state_dict(source_meta["env_state"]["pool"])
         if stage == "distill":
-            uid = pool.add_state("tactical", source_state["actor_state_dict"], source_meta["actor_cfg"], source_state["iter"])
+            uid = pool.add_state("tactical", source_state["actor_state_dict"], source_meta["actor_cfg"],
+                                 source_state["iter"], source_state.get("skill_state_dicts"))
             teacher_model = pool.model(OpponentChoice("tactical", uid), device)
     config = train_config(stage, args.iterations, args.seed, args.logger)
     env_cfg = make_football_env_cfg(args.num_envs, seed=args.seed)
@@ -336,6 +349,7 @@ def run(args) -> Path:
     wrapped = FootballVecEnv(
         FootballArena(game_env, debug_numerics=args.debug_numerics),
         stage, pool, skills, teacher_model, seed=args.seed, dual_rollouts=True,
+        train_skills=args.train_skills if stage == "tactics" else False,
     )
     if recorder is not None:
         recorder.football_env = wrapped
@@ -355,7 +369,14 @@ def run(args) -> Path:
             runner.alg.actor.load_state_dict(source_state["actor_state_dict"], strict=True)
             runner.alg.critic.load_state_dict(source_state["critic_state_dict"], strict=True)
         elif stage == "distill":
-            warm_start_joint_actor_from_walk(runner.alg.actor, skill_paths["walk"])
+            walk_checkpoint = torch.load(skill_paths["walk"], map_location="cpu", weights_only=False)
+            if "skill_state_dicts" in source_state:
+                actor_state = walk_checkpoint.get("actor_state_dict", walk_checkpoint)
+                actor_state.update({
+                    key: value for key, value in source_state["skill_state_dicts"]["walk"].items()
+                    if key.startswith("mlp.")
+                })
+            warm_start_joint_actor_from_walk(runner.alg.actor, walk_checkpoint)
         elif stage == "joint":
             expand_football_checkpoint_observations(source_state, runner.alg.actor)
             runner.alg.actor.load_state_dict(source_state["actor_state_dict"], strict=True)

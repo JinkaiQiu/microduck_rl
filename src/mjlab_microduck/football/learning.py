@@ -22,6 +22,15 @@ class TeacherTargetStorage(RolloutStorage):
         super().__init__("rl", num_envs, num_steps, obs, action_shape, device)
         self.teacher_targets = torch.zeros_like(self.actions)
         self.valid = torch.ones((num_steps, num_envs), device=device, dtype=torch.bool)
+        self.skill_obs = None
+        self.skill_branches = None
+        self.skill_actions = None
+
+    def enable_skill_training(self) -> None:
+        shape = (self.num_transitions_per_env, self.num_envs)
+        self.skill_obs = torch.zeros((*shape, 61), device=self.device)
+        self.skill_branches = torch.zeros(shape, device=self.device, dtype=torch.long)
+        self.skill_actions = torch.zeros((*shape, 14), device=self.device)
 
     def add_transition(self, transition):
         if transition.privileged_actions is None:
@@ -35,6 +44,18 @@ class TeacherTargetStorage(RolloutStorage):
         if valid.shape != (self.num_envs,):
             raise ValueError("live-seat mask must have one entry per rollout row")
         self.valid[self.step].copy_(valid)
+        if self.skill_obs is not None:
+            detail = getattr(transition, "skill_transition", None)
+            if detail is None:
+                raise ValueError("skill transition is required when training skills")
+            for target, key in (
+                (self.skill_obs, "skill_obs"),
+                (self.skill_branches, "branch"),
+                (self.skill_actions, "joint_actions"),
+            ):
+                if detail[key].shape != target[self.step].shape:
+                    raise ValueError(f"invalid {key} shape in skill transition")
+                target[self.step].copy_(detail[key])
         super().add_transition(transition)
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -55,7 +76,7 @@ class TeacherTargetStorage(RolloutStorage):
             for idx in torch.tensor_split(shuffled, num_mini_batches):
                 if not idx.numel():
                     continue
-                yield RolloutStorage.Batch(
+                batch = RolloutStorage.Batch(
                     observations=observations[idx],
                     actions=actions[idx],
                     values=values[idx],
@@ -65,6 +86,11 @@ class TeacherTargetStorage(RolloutStorage):
                     old_distribution_params=tuple(p[idx] for p in old_params),
                     privileged_actions=targets[idx],
                 )
+                if self.skill_obs is not None:
+                    batch.skill_obs = self.skill_obs.flatten(0, 1)[idx]
+                    batch.skill_branches = self.skill_branches.flatten(0, 1)[idx]
+                    batch.skill_actions = self.skill_actions.flatten(0, 1)[idx]
+                yield batch
 
 
 class FootballPPO(PPO):
@@ -101,6 +127,9 @@ class FootballPPO(PPO):
         self.teacher_loss_coef = teacher_loss_coef_start
         self.teacher_target_fn = None
         self.after_update = None
+        self.trainable_skills = None
+        self.skill_transition_fn = None
+        self.skill_std = 0.1
         self.storage = TeacherTargetStorage(
             storage.num_envs,
             storage.num_transitions_per_env,
@@ -110,6 +139,42 @@ class FootballPPO(PPO):
         )
         if self.actor.is_recurrent or self.critic.is_recurrent or self.symmetry or self.rnd:
             raise ValueError("football PPO supports feedforward actors without RND or symmetry")
+
+    def configure_trainable_skills(self, controller, *, std: float = 0.05,
+                                   learning_rate_scale: float = 0.01) -> None:
+        """Make sampled joint actions part of the tactical PPO likelihood."""
+        if self.trainable_skills is not None or std <= 0 or learning_rate_scale <= 0:
+            raise ValueError("skill training already configured or invalid skill hyperparameter")
+        self.skill_std = float(std)
+        self.trainable_skills = (controller.walk, controller.kick, controller.recover)
+        for skill in self.trainable_skills:
+            skill.requires_grad_(True)
+        self.optimizer.add_param_group({
+            "params": [parameter for skill in self.trainable_skills for parameter in skill.parameters()],
+            "lr": self.learning_rate * learning_rate_scale,
+            "skill_lr_scale": learning_rate_scale,
+        })
+        self.storage.enable_skill_training()
+
+    def sample_skills(self, mean, skill_obs, branch):
+        """Rollout sample; the skill log probability is stored with the tactical one."""
+        if self.trainable_skills is None:
+            raise RuntimeError("skill training has not been configured")
+        if mean.shape != (len(branch), 14) or skill_obs.shape != (len(branch), 61):
+            raise ValueError("invalid skill sampler inputs")
+        distribution = torch.distributions.Normal(mean, self.skill_std)
+        action = distribution.sample()
+        return action, distribution.log_prob(action).sum(dim=-1)
+
+    def _skill_log_prob(self, skill_obs, branches, joint_actions):
+        mean = torch.zeros_like(joint_actions)
+        for branch, skill in enumerate(self.trainable_skills):
+            selected = branches == branch
+            if selected.any():
+                mean[selected] = skill(skill_obs[selected])
+        if ((branches < 0) | (branches > 2)).any():
+            raise ValueError("invalid football skill branch")
+        return torch.distributions.Normal(mean, self.skill_std).log_prob(joint_actions).sum(dim=-1)
 
     def set_iteration(self, iteration: int) -> None:
         if iteration < 0:
@@ -150,6 +215,18 @@ class FootballPPO(PPO):
         if valid.shape != (len(rewards),):
             raise ValueError("live-seat mask must match the rollout batch")
         self.transition.valid_mask = valid
+        if self.trainable_skills is not None:
+            if self.skill_transition_fn is None:
+                raise RuntimeError("skill transition callback is missing")
+            detail = self.skill_transition_fn()
+            if detail is None:
+                raise RuntimeError("executed joint actions are missing from the skill rollout")
+            if detail["old_log_prob"].shape != (len(rewards),):
+                raise ValueError("skill log probabilities must match rollout rows")
+            if not torch.isfinite(detail["old_log_prob"][valid]).all():
+                raise ValueError("nonfinite skill log probabilities")
+            self.transition.skill_transition = detail
+            self.transition.actions_log_prob += detail["old_log_prob"]
         # Frozen seats are observed for action routing but never train the
         # actor, critic, their normalizers, or the teacher-guidance loss.
         live_obs = self.transition.observations[valid]
@@ -195,6 +272,10 @@ class FootballPPO(PPO):
                 batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             self.actor(batch.observations, stochastic_output=True)
             log_prob = self.actor.get_output_log_prob(batch.actions)
+            if self.trainable_skills is not None:
+                log_prob = log_prob + self._skill_log_prob(
+                    batch.skill_obs, batch.skill_branches, batch.skill_actions,
+                )
             values = self.critic(batch.observations)
             entropy = self.actor.output_entropy.mean()
             new_params = self.actor.output_distribution_params
@@ -206,7 +287,7 @@ class FootballPPO(PPO):
                     elif 0 < kl < self.desired_kl / 2:
                         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
                     for group in self.optimizer.param_groups:
-                        group["lr"] = self.learning_rate
+                        group["lr"] = self.learning_rate * group.get("skill_lr_scale", 1.0)
             ratio = torch.exp(log_prob - batch.old_actions_log_prob.squeeze(-1))
             advantage = batch.advantages.squeeze(-1)
             surrogate = -advantage * ratio
@@ -229,6 +310,11 @@ class FootballPPO(PPO):
                 self.reduce_parameters()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            if self.trainable_skills is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    [parameter for skill in self.trainable_skills for parameter in skill.parameters()],
+                    self.max_grad_norm,
+                )
             self.optimizer.step()
             for key, value in (("value", value_loss), ("surrogate", surrogate_loss), ("entropy", entropy), ("teacher", teacher_loss)):
                 means[key] += value.item()
@@ -241,11 +327,25 @@ class FootballPPO(PPO):
 
     def save(self):
         result = super().save()
+        if self.trainable_skills is not None:
+            result["skill_state_dicts"] = {
+                name: skill.state_dict() for name, skill in zip(
+                    ("walk", "kick", "recovery"), self.trainable_skills, strict=True,
+                )
+            }
+            result["skill_action_std"] = self.skill_std
         result["football_iteration"] = self.iteration
         result["football_update_count"] = self.update_count
         return result
 
     def load(self, loaded_dict, load_cfg, strict):
+        if self.trainable_skills is not None:
+            states = loaded_dict.get("skill_state_dicts")
+            if states is None:
+                raise ValueError("checkpoint has no trainable skill state")
+            for name, skill in zip(("walk", "kick", "recovery"), self.trainable_skills, strict=True):
+                skill.load_state_dict(states[name], strict=True)
+            self.skill_std = float(loaded_dict["skill_action_std"])
         restore_iteration = super().load(loaded_dict, load_cfg, strict)
         if restore_iteration:
             self.update_count = loaded_dict.get("football_update_count", loaded_dict.get("iter", 0))

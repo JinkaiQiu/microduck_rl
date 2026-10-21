@@ -1,6 +1,7 @@
 """CPU-only invariants for student-driven football PPO and walk warm start."""
 
 import torch
+from types import SimpleNamespace
 from tensordict import TensorDict
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
@@ -15,27 +16,79 @@ def _observations(value=0.0, count=4, width=66):
     )
 
 
-def _actor(obs):
+def _actor(obs, action_dim=14):
     return MLPModel(
-        obs, {"actor": ["actor"]}, "actor", 14, hidden_dims=(32, 16),
+        obs, {"actor": ["actor"]}, "actor", action_dim, hidden_dims=(32, 16),
         obs_normalization=True,
         distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
     )
 
 
-def _algorithm(teacher_coef=1.0):
+def _algorithm(teacher_coef=1.0, action_dim=14):
     obs = _observations()
     critic = MLPModel(
         obs, {"critic": ["critic"]}, "critic", 1,
         hidden_dims=(32, 16), obs_normalization=True,
     )
     return FootballPPO(
-        _actor(obs), critic, RolloutStorage("rl", 4, 2, obs, [14]),
+        _actor(obs, action_dim), critic, RolloutStorage("rl", 4, 2, obs, [action_dim]),
         teacher_loss_coef_start=teacher_coef,
         num_learning_epochs=1,
         num_mini_batches=2,
         desired_kl=None,
     )
+
+
+def test_tactical_ppo_updates_executed_skill_weights_and_restores_them():
+    torch.manual_seed(17)
+    algorithm = _algorithm(teacher_coef=0.0, action_dim=4)
+    algorithm.num_mini_batches = 1  # Include every routed branch in the first PPO update.
+    controller = SimpleNamespace(**{
+        name: torch.nn.Linear(61, 14, bias=False)
+        for name in ("walk", "kick", "recover")
+    })
+    algorithm.configure_trainable_skills(controller, std=0.05)
+    pending = []
+    algorithm.skill_transition_fn = lambda: pending.pop(0)
+    initial = [skill.weight.detach().clone() for skill in algorithm.trainable_skills]
+    for step in range(2):
+        obs = _observations(float(step))
+        algorithm.act(obs)
+        tactical_log_prob = algorithm.transition.actions_log_prob.clone()
+        skill_obs = torch.randn(4, 61)
+        branches = torch.tensor([0, 1, 2, 0])
+        means = torch.stack([
+            algorithm.trainable_skills[int(branch)](skill_obs[row])
+            for row, branch in enumerate(branches)
+        ])
+        joint, joint_log_prob = algorithm.sample_skills(means, skill_obs, branches)
+        pending.append({
+            "skill_obs": skill_obs, "branch": branches,
+            "joint_actions": joint.detach(), "old_log_prob": joint_log_prob.detach(),
+        })
+        algorithm.process_env_step(
+            obs, torch.tensor([1.0, -0.5, 0.2, 2.0]) * (step + 1),
+            torch.zeros(4, dtype=torch.bool), {},
+        )
+        torch.testing.assert_close(
+            algorithm.storage.actions_log_prob[step, :, 0],
+            tactical_log_prob.squeeze(-1) + joint_log_prob,
+        )
+    algorithm.compute_returns(_observations(2.0))
+    algorithm.update()
+    assert all(not torch.equal(before, skill.weight)
+               for before, skill in zip(initial, algorithm.trainable_skills, strict=True))
+    saved = algorithm.save()
+    restored = _algorithm(teacher_coef=0.0, action_dim=4)
+    restored_controller = SimpleNamespace(**{
+        name: torch.nn.Linear(61, 14, bias=False)
+        for name in ("walk", "kick", "recover")
+    })
+    restored.configure_trainable_skills(restored_controller)
+    restored.load(saved, None, True)
+    for expected, actual in zip(algorithm.trainable_skills, restored.trainable_skills, strict=True):
+        torch.testing.assert_close(expected.weight, actual.weight)
+    assert len(restored.optimizer.param_groups) == 2
 
 
 def _step(algorithm, obs):

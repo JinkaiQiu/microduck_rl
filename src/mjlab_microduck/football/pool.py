@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from tensordict import TensorDict
 
+if TYPE_CHECKING:
+    from mjlab_microduck.football.skills import FootballSkills
 
 PolicyKind = Literal["tactical", "joint"]
 
@@ -33,6 +35,7 @@ class OpponentPool:
         self._snapshots: dict[int, dict] = {}
         self._recent: dict[PolicyKind, list[int]] = {"tactical": [], "joint": []}
         self._model_cache: dict[tuple[int, str], torch.nn.Module] = {}
+        self._skill_cache: dict[tuple[int, str, int], FootballSkills] = {}
         self._rng = torch.Generator(device="cpu")
         self._rng.manual_seed(seed)
 
@@ -44,14 +47,18 @@ class OpponentPool:
     def joint_count(self) -> int:
         return len(self._recent["joint"])
 
-    def add(self, kind: PolicyKind, actor: torch.nn.Module, actor_cfg: dict, iteration: int) -> int:
+    def add(self, kind: PolicyKind, actor: torch.nn.Module, actor_cfg: dict, iteration: int,
+            skill_state_dicts: dict[str, dict[str, torch.Tensor]] | None = None) -> int:
         """Freeze the actor, including normalizer buffers, in CPU storage."""
-        return self.add_state(kind, actor.state_dict(), actor_cfg, iteration)
+        return self.add_state(kind, actor.state_dict(), actor_cfg, iteration, skill_state_dicts)
 
-    def add_state(self, kind: PolicyKind, actor_state_dict: dict, actor_cfg: dict, iteration: int) -> int:
+    def add_state(self, kind: PolicyKind, actor_state_dict: dict, actor_cfg: dict, iteration: int,
+                  skill_state_dicts: dict[str, dict[str, torch.Tensor]] | None = None) -> int:
         """Add an actor state from a checkpoint without building it first."""
         if kind not in self._recent:
             raise ValueError(f"unknown opponent kind: {kind}")
+        if skill_state_dicts is not None and set(skill_state_dicts) - {"walk", "kick", "recovery"}:
+            raise ValueError("skill snapshots must be keyed by walk, kick, or recovery")
         uid = self._next_uid
         self._next_uid += 1
         self._snapshots[uid] = {
@@ -62,6 +69,11 @@ class OpponentPool:
                 key: value.detach().cpu().clone() for key, value in actor_state_dict.items()
             },
         }
+        if skill_state_dicts is not None:
+            self._snapshots[uid]["skill_state_dicts"] = {
+                name: {key: value.detach().cpu().clone() for key, value in state.items()}
+                for name, state in skill_state_dicts.items()
+            }
         recent = self._recent[kind]
         recent.append(uid)
         del recent[:-self.capacity]
@@ -126,6 +138,28 @@ class OpponentPool:
             self._model_cache[key] = model
         return self._model_cache[key]
 
+    def skill_controller(self, choice: OpponentChoice, base_skills: tuple,
+                         num_envs: int, device: str | torch.device) -> FootballSkills:
+        """Build frozen skills and persistent timers for a tactical snapshot."""
+        from mjlab_microduck.football.skills import FootballSkills
+
+        if choice.kind != "tactical":
+            raise ValueError("only tactical opponents have a frozen skill controller")
+        key = (choice.uid, str(torch.device(device)), num_envs)
+        if key not in self._skill_cache:
+            snapshot = self._snapshots[choice.uid]
+            states = snapshot.get("skill_state_dicts", {})
+            policies = []
+            for name, base in zip(("walk", "kick", "recovery"), base_skills, strict=True):
+                policy = deepcopy(base).to(device)
+                if name in states:
+                    policy.load_state_dict(states[name], strict=True)
+                policy.eval()
+                policy.requires_grad_(False)
+                policies.append(policy)
+            self._skill_cache[key] = FootballSkills(*policies, num_envs=num_envs, device=device)
+        return self._skill_cache[key]
+
     def prune(self, active_uids: set[int]) -> None:
         """Discard snapshots no longer in the rolling pool or an active match."""
         keep = active_uids | set(self._recent["tactical"]) | set(self._recent["joint"])
@@ -134,6 +168,9 @@ class OpponentPool:
         for key in list(self._model_cache):
             if key[0] not in keep:
                 del self._model_cache[key]
+        for key in list(self._skill_cache):
+            if key[0] not in keep:
+                del self._skill_cache[key]
 
     def state_dict(self) -> dict:
         return {
@@ -151,6 +188,7 @@ class OpponentPool:
         self._recent = deepcopy(state["recent"])
         self._rng.set_state(state["rng_state"].cpu())
         self._model_cache.clear()
+        self._skill_cache.clear()
 
 
 def actor_input(model: torch.nn.Module, observations: torch.Tensor) -> torch.Tensor:

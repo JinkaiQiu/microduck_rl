@@ -83,7 +83,6 @@ class FrozenSkillPolicy(nn.Module):
             raise ValueError(f"No actor state dict in {path}")
         return cls(state, input_dim, output_dim).to(device)
 
-    @torch.no_grad()
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         if obs.ndim != 2 or obs.shape[1] != self.mean.shape[1]:
             raise ValueError(f"Expected (N, {self.mean.shape[1]}) skill observations")
@@ -149,6 +148,19 @@ class FootballSkills:
         self, tactic_actions: torch.Tensor, obs61: torch.Tensor,
         ball_body_xy: torch.Tensor, env_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self.act_with_info(tactic_actions, obs61, ball_body_xy, env_ids)[0]
+
+    @torch.no_grad()
+    def act_with_info(
+        self, tactic_actions: torch.Tensor, obs61: torch.Tensor,
+        ball_body_xy: torch.Tensor, env_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return joint means, routed observations, and walk/kick/recover IDs.
+
+        Routing advances the kick timers once, just as ``act`` does. The
+        observations and branch IDs can be stored for subsequent PPO updates
+        that evaluate the selected skill directly with gradients enabled.
+        """
         n = tactic_actions.shape[0]
         if tactic_actions.shape != (n, 4) or obs61.shape != (n, 61) or ball_body_xy.shape != (n, 2):
             raise ValueError("Expected tactical (N,4), skill obs (N,61), ball body XY (N,2)")
@@ -161,7 +173,7 @@ class FootballSkills:
         if env_ids.shape != (n,) or env_ids.dtype != torch.long or torch.unique(env_ids).numel() != n:
             raise ValueError("env_ids must be distinct long indices, one per input row")
         if n == 0:
-            return obs61.new_empty((0, 14))
+            return obs61.new_empty((0, 14)), obs61.clone(), torch.empty(0, dtype=torch.long, device=self.device)
 
         action = tactic_actions.nan_to_num().clone()
         action[:, 0].clamp_(-0.4, 0.4)
@@ -183,21 +195,21 @@ class FootballSkills:
         active_kick = self.kick_remaining[env_ids] > 0
         walking = ~fallen & ~active_kick
         kicking = ~fallen & active_kick
+        routed_obs = obs61.clone()
+        routed_obs[:, 48:51] = 0
+        routed_obs[walking, 48:51] = action[walking, :3]
+        branch_ids = torch.zeros(n, dtype=torch.long, device=self.device)
+        branch_ids[kicking] = 1
+        branch_ids[fallen] = 2
         result = obs61.new_empty((n, 14))
         if walking.any():
-            walk_obs = obs61[walking].clone()
-            walk_obs[:, 48:51] = action[walking, :3]
-            result[walking] = self.walk(walk_obs)
+            result[walking] = self.walk(routed_obs[walking])
         if kicking.any():
-            kick_obs = obs61[kicking].clone()
-            kick_obs[:, 48:51] = 0
-            result[kicking] = self.kick(kick_obs)
+            result[kicking] = self.kick(routed_obs[kicking])
         if fallen.any():
-            recover_obs = obs61[fallen].clone()
-            recover_obs[:, 48:51] = 0
-            result[fallen] = self.recover(recover_obs)
+            result[fallen] = self.recover(routed_obs[fallen])
         self.kick_remaining[env_ids] = (self.kick_remaining[env_ids] - 1).clamp_min_(0)
-        return result
+        return result, routed_obs, branch_ids
 
 
 @torch.no_grad()

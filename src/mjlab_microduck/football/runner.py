@@ -39,6 +39,10 @@ class FootballRunner(OnPolicyRunner):
                 for optional in ("rnn_type", "rnn_hidden_dim", "rnn_num_layers"):
                     train_cfg[key].pop(optional, None)
         super().__init__(env, train_cfg, log_dir, device)
+        if env.train_skills:
+            self.alg.configure_trainable_skills(env.learner_skills)
+            env.skill_sampler = self.alg.sample_skills
+            self.alg.skill_transition_fn = env.consume_skill_transition
         if env.stage == "distill":
             self.alg.teacher_target_fn = env.teacher_targets
         self.alg.after_update = self._after_update
@@ -48,7 +52,8 @@ class FootballRunner(OnPolicyRunner):
         if completed_iterations % 200 or self.env.stage not in ("tactics", "joint"):
             return
         kind = "tactical" if self.env.stage == "tactics" else "joint"
-        self.env.pool.add(kind, self.alg.actor, self.actor_cfg, completed_iterations)
+        skill_states = self.alg.save().get("skill_state_dicts") if kind == "tactical" else None
+        self.env.pool.add(kind, self.alg.actor, self.actor_cfg, completed_iterations, skill_states)
         self.save(str(self._log_dir / f"snapshot_{completed_iterations}.pt"))
 
     def save(self, path: str, infos: dict | None = None) -> None:
@@ -66,6 +71,7 @@ class FootballRunner(OnPolicyRunner):
             "stage": self.env.stage,
             "actor_cfg": deepcopy(self.actor_cfg),
             "skill_hashes": dict(self.skill_hashes),
+            "train_skills": self.env.train_skills,
             "source_checkpoint": self.source_checkpoint,
             "env_state": self.env.state_dict(),
             "common_step_counter": self.env.unwrapped.common_step_counter,
@@ -88,6 +94,8 @@ class FootballRunner(OnPolicyRunner):
             raise ValueError("checkpoint is not from the requested football stage")
         if meta["skill_hashes"] != self.skill_hashes:
             raise ValueError("skill checkpoints differ from those in the saved football run")
+        if bool(meta.get("train_skills", False)) != self.env.train_skills:
+            raise ValueError("checkpoint skill-training mode differs from the current run")
         expand_football_checkpoint_observations(state, self.alg.actor, self.alg.critic)
         self.alg.load(state, load_cfg, strict)
         self.current_learning_iteration = int(state["iter"])

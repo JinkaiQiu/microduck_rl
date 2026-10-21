@@ -180,3 +180,41 @@ def test_rolling_win_rates_are_match_level_and_survive_resume():
         assert wrapped._win_rate_logs() == logs
     finally:
         wrapped.close()
+
+
+def test_trainable_skills_share_live_modules_and_record_executed_actions():
+    base = ManagerBasedRlEnv(cfg=make_football_env_cfg(2), device="cpu")
+    policies = tuple(torch.nn.Linear(61, 14) for _ in range(3))
+    for policy in policies:
+        torch.nn.init.zeros_(policy.weight)
+        torch.nn.init.zeros_(policy.bias)
+        policy.requires_grad_(False)
+
+    def sample(mean, obs, branch):
+        return mean + 0.125, mean.new_full((len(mean),), -2.0)
+
+    wrapped = FootballVecEnv(
+        FootballArena(base), "tactics", OpponentPool(seed=2), policies,
+        dual_rollouts=True, train_skills=True, skill_sampler=sample,
+    )
+    try:
+        assert wrapped.learner_skills.walk is not policies[0]
+        assert wrapped.live_opponent_skills.walk is wrapped.learner_skills.walk
+        assert wrapped.opponent_skills.walk is policies[0]
+        assert wrapped.learner_skills.walk.weight.requires_grad
+        assert not policies[0].weight.requires_grad
+        assert wrapped.live_opponent_skills.kick_remaining is not wrapped.learner_skills.kick_remaining
+        wrapped.learner_home[:] = True
+        wrapped.opponent_choices[:] = [OpponentChoice("live"), OpponentChoice("scripted")]
+        tactics = torch.zeros((4, 4))
+        tactics[:, 3] = -1
+        _, _, _, extras = wrapped.step(tactics)
+        transition = wrapped.consume_skill_transition()
+        assert transition["skill_obs"].shape == (4, 61)
+        assert extras["learner_mask"].tolist() == [True, True, True, False]
+        torch.testing.assert_close(transition["old_log_prob"], torch.tensor([-2., -2., -2., 0.]))
+        torch.testing.assert_close(transition["joint_actions"][:3], torch.full((3, 14), 0.125))
+        torch.testing.assert_close(base.action_manager.action[0, 14:], transition["joint_actions"][2])
+        assert wrapped.consume_skill_transition() is None
+    finally:
+        wrapped.close()
