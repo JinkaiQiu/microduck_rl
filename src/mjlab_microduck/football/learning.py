@@ -110,9 +110,11 @@ class FootballPPO(PPO):
         teacher_loss_coef_start: float = 0.0,
         teacher_loss_coef_end: float | None = None,
         teacher_decay_iterations: int = 2000,
+        diagnostics: bool = False,
         **kwargs,
     ):
         super().__init__(actor, critic, storage, **kwargs)
+        self.diagnostics = diagnostics
         if teacher_loss_coef_end is None:
             teacher_loss_coef_end = 0.1 if teacher_loss_coef_start else 0.0
         if teacher_loss_coef_start < 0 or teacher_loss_coef_end < 0:
@@ -264,6 +266,11 @@ class FootballPPO(PPO):
         if self.actor.is_recurrent or self.critic.is_recurrent or self.symmetry or self.rnd:
             raise ValueError("football PPO supports feedforward actors without RND or symmetry")
         means = {"value": 0.0, "surrogate": 0.0, "entropy": 0.0, "teacher": 0.0}
+        diagnostic_names = (
+            "kl", "clip_fraction", "actor_grad_norm", "critic_grad_norm",
+            "entropy_coefficient", "entropy_bonus",
+        )
+        diagnostic_totals = torch.zeros(len(diagnostic_names), device=self.device) if self.diagnostics else None
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         batches = 0
         for batch in generator:
@@ -279,9 +286,13 @@ class FootballPPO(PPO):
             values = self.critic(batch.observations)
             entropy = self.actor.output_entropy.mean()
             new_params = self.actor.output_distribution_params
-            if self.desired_kl is not None and self.schedule == "adaptive":
+            adaptive = self.desired_kl is not None and self.schedule == "adaptive"
+            if adaptive or self.diagnostics:
                 with torch.no_grad():
+                    # Actor-distribution KL is also logged with a fixed learning rate.
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, new_params).mean()
+            if adaptive:
+                with torch.no_grad():
                     if kl > 2 * self.desired_kl:
                         self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                     elif 0 < kl < self.desired_kl / 2:
@@ -308,14 +319,21 @@ class FootballPPO(PPO):
             loss.backward()
             if self.is_multi_gpu:
                 self.reduce_parameters()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             if self.trainable_skills is not None:
                 torch.nn.utils.clip_grad_norm_(
                     [parameter for skill in self.trainable_skills for parameter in skill.parameters()],
                     self.max_grad_norm,
                 )
             self.optimizer.step()
+            if self.diagnostics:
+                with torch.no_grad():
+                    clip_fraction = ((ratio < 1 - self.clip_param) | (ratio > 1 + self.clip_param)).float().mean()
+                    diagnostic_totals += torch.stack((
+                        kl, clip_fraction, actor_grad_norm, critic_grad_norm,
+                        entropy.new_tensor(self.entropy_coef), self.entropy_coef * entropy.detach(),
+                    ))
             for key, value in (("value", value_loss), ("surrogate", surrogate_loss), ("entropy", entropy), ("teacher", teacher_loss)):
                 means[key] += value.item()
         n = batches
@@ -323,7 +341,10 @@ class FootballPPO(PPO):
         self.update_count += 1
         if self.after_update is not None:
             self.after_update(self.update_count)
-        return {key: value / n for key, value in means.items()} | {"teacher_coef": self.teacher_loss_coef}
+        result = {key: value / n for key, value in means.items()} | {"teacher_coef": self.teacher_loss_coef}
+        if self.diagnostics:
+            result.update(zip(diagnostic_names, (diagnostic_totals / n).cpu().tolist(), strict=True))
+        return result
 
     def save(self):
         result = super().save()

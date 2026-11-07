@@ -1,5 +1,6 @@
 """CPU-only invariants for student-driven football PPO and walk warm start."""
 
+import math
 import torch
 from types import SimpleNamespace
 from tensordict import TensorDict
@@ -24,7 +25,7 @@ def _actor(obs, action_dim=14):
     )
 
 
-def _algorithm(teacher_coef=1.0, action_dim=14):
+def _algorithm(teacher_coef=1.0, action_dim=14, **kwargs):
     obs = _observations()
     critic = MLPModel(
         obs, {"critic": ["critic"]}, "critic", 1,
@@ -36,6 +37,7 @@ def _algorithm(teacher_coef=1.0, action_dim=14):
         num_learning_epochs=1,
         num_mini_batches=2,
         desired_kl=None,
+        **kwargs,
     )
 
 
@@ -97,6 +99,37 @@ def _step(algorithm, obs):
         _observations(99.0), torch.ones(4), torch.zeros(4, dtype=torch.bool), {}
     )
     return student_action
+
+
+def test_ppo_diagnostics_are_opt_in_finite_and_preserve_updates():
+    default_keys = {"value", "surrogate", "entropy", "teacher", "teacher_coef"}
+    diagnostic_keys = {
+        "kl", "clip_fraction", "actor_grad_norm", "critic_grad_norm",
+        "entropy_coefficient", "entropy_bonus",
+    }
+    algorithms = []
+    for diagnostics in (False, True):
+        torch.manual_seed(23)
+        algorithm = _algorithm(teacher_coef=0.0, diagnostics=diagnostics, entropy_coef=0.02)
+        for step in range(2):
+            _step(algorithm, _observations(float(step)))
+        algorithm.compute_returns(_observations(2.0))
+        losses = algorithm.update()
+        assert set(losses) == default_keys | (diagnostic_keys if diagnostics else set())
+        if diagnostics:
+            assert all(math.isfinite(losses[key]) for key in diagnostic_keys)
+            assert 0 <= losses["clip_fraction"] <= 1
+            assert losses["actor_grad_norm"] >= 0
+            assert losses["critic_grad_norm"] >= 0
+            assert math.isclose(losses["entropy_coefficient"], 0.02, rel_tol=1e-6)
+            assert math.isclose(losses["entropy_bonus"], 0.02 * losses["entropy"], rel_tol=1e-6)
+        algorithms.append(algorithm)
+    for model_name in ("actor", "critic"):
+        for expected, actual in zip(
+            getattr(algorithms[0], model_name).parameters(),
+            getattr(algorithms[1], model_name).parameters(), strict=True,
+        ):
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
 
 def test_teacher_labels_student_pre_action_state_in_raw_14d_units():
